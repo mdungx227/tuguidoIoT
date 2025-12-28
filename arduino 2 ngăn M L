@@ -1,0 +1,191 @@
+// =====================================================================
+// ESP32 – 2 LOCKERS (L1, M1) – Relay + Servo + Firebase (REST API)
+// =====================================================================
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+
+// ================== WIFI CONFIG ==================
+const char* WIFI_SSID     = "Khoi Nguyen";
+const char* WIFI_PASSWORD = "abcde12345";
+
+// ================== FIREBASE ==================
+String FIREBASE_URL = "https://minhquang-36ee2-default-rtdb.firebaseio.com";
+
+// ================== LOCKER STRUCT ==================
+struct LockerHW {
+  const char* id;        // L1, M1
+  int relayPin;          // GPIO relay
+  int servoPin;          // GPIO servo
+  bool activeLow;        // relay active LOW/HIGH
+
+  Servo servo;
+  bool isOpen;
+  unsigned long openTime;
+};
+
+// ================== LOCKER CONFIG ==================
+LockerHW lockers[] = {
+  { "L1", 5,  4,  false },   // Locker L1  | Relay D5  | Servo D4
+  { "M1", 25, 26, false },  // Locker M1  | Relay D25 | Servo D26
+};
+
+const int N = sizeof(lockers) / sizeof(lockers[0]);
+
+// ================== AUTO CLOSE ==================
+const unsigned long AUTO_CLOSE_DELAY = 60000; // 60 giây
+unsigned long lastPoll = 0;
+
+// =====================================================================
+// FIREBASE REST FUNCTIONS
+// =====================================================================
+String firebaseGet(String path) {
+  HTTPClient http;
+  String url = FIREBASE_URL + path + ".json";
+
+  http.begin(url);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return "";
+  }
+
+  String payload = http.getString();
+  http.end();
+  return payload;
+}
+
+void firebaseSet(String path, String valueJson) {
+  HTTPClient http;
+  String url = FIREBASE_URL + path + ".json";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.PUT(valueJson);
+  http.end();
+}
+
+String lockerBase(const char* id) {
+  return String("/Lockers/") + id;
+}
+
+void clearCommand(const char* id) {
+  firebaseSet(lockerBase(id) + "/command", "\"none\"");
+}
+
+// =====================================================================
+// DEVICE CONTROL
+// =====================================================================
+void setRelay(LockerHW &L, bool on) {
+  if (L.activeLow)
+    digitalWrite(L.relayPin, on ? LOW : HIGH);
+  else
+    digitalWrite(L.relayPin, on ? HIGH : LOW);
+}
+
+void doOpen(LockerHW &L) {
+  setRelay(L, true);
+  delay(800);
+  L.servo.write(90);
+
+  L.isOpen = true;
+  L.openTime = millis();
+
+  firebaseSet(lockerBase(L.id) + "/door", "\"open\"");
+}
+
+void doClose(LockerHW &L) {
+  L.servo.write(0);
+  delay(800);
+  setRelay(L, false);
+
+  L.isOpen = false;
+
+  firebaseSet(lockerBase(L.id) + "/door", "\"closed\"");
+}
+
+// =====================================================================
+// SETUP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+
+  // ----- WiFi -----
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(400);
+  }
+  Serial.println("\nWiFi connected!");
+
+  // ----- Init Lockers -----
+  for (int i = 0; i < N; i++) {
+    pinMode(lockers[i].relayPin, OUTPUT);
+    digitalWrite(lockers[i].relayPin,
+                 lockers[i].activeLow ? HIGH : LOW);
+
+    lockers[i].servo.setPeriodHertz(50);
+    lockers[i].servo.attach(lockers[i].servoPin, 500, 2500);
+    lockers[i].servo.write(0);
+
+    lockers[i].isOpen = false;
+
+    // reset command
+    firebaseSet(lockerBase(lockers[i].id) + "/command", "\"none\"");
+    firebaseSet(lockerBase(lockers[i].id) + "/door", "\"closed\"");
+  }
+
+  Serial.println("System ready. Polling /Lockers");
+}
+
+// =====================================================================
+// LOOP
+// =====================================================================
+void loop() {
+
+  // ---------- AUTO CLOSE ----------
+  for (int i = 0; i < N; i++) {
+    if (lockers[i].isOpen &&
+        millis() - lockers[i].openTime >= AUTO_CLOSE_DELAY) {
+
+      Serial.printf("AUTO CLOSE -> %s\n", lockers[i].id);
+      doClose(lockers[i]);
+      clearCommand(lockers[i].id);
+    }
+  }
+
+  // ---------- POLL FIREBASE ----------
+  if (millis() - lastPoll < 1000) return;
+  lastPoll = millis();
+
+  String raw = firebaseGet("/Lockers");
+  if (raw.length() == 0) return;
+
+  StaticJsonDocument<4096> doc;
+  DeserializationError err = deserializeJson(doc, raw);
+  if (err) {
+    Serial.println("JSON parse error");
+    return;
+  }
+
+  // ---------- HANDLE EACH LOCKER ----------
+  for (int i = 0; i < N; i++) {
+    const char* id = lockers[i].id;
+    const char* cmd = doc[id]["command"] | "none";
+
+    if (strcmp(cmd, "open") == 0) {
+      Serial.printf("CMD OPEN -> %s\n", id);
+      doOpen(lockers[i]);
+      clearCommand(id);
+    }
+
+    else if (strcmp(cmd, "close") == 0) {
+      Serial.printf("CMD CLOSE -> %s\n", id);
+      doClose(lockers[i]);
+      clearCommand(id);
+    }
+  }
+}
