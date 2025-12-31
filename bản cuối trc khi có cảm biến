@@ -1,0 +1,205 @@
+// =====================================================================
+// ESP32 – 2 LOCKERS (L1, M1)
+// Relay + Servo + Firebase (REST API)
+// Tách riêng góc OPEN / CLOSE cho từng tủ
+// Servo quay êm (smooth)
+// =====================================================================
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+
+// ================== WIFI ==================
+const char* WIFI_SSID     = "Khoi Nguyen";
+const char* WIFI_PASSWORD = "abcde12345";
+
+// ================== FIREBASE ==================
+String FIREBASE_URL = "https://minhquang-36ee2-default-rtdb.firebaseio.com";
+
+// ================== SERVO CONFIG ==================
+const int SERVO_STEP_DELAY = 15;   // ms → càng lớn quay càng chậm
+const int SERVO_STEP       = 1;    // bước góc mỗi lần
+
+// ================== LOCKER STRUCT ==================
+struct LockerHW {
+  const char* id;
+  int relayPin;
+  int servoPin;
+  bool activeLow;
+
+  int angleOpen;      // góc MỞ
+  int angleClose;     // góc ĐÓNG (góc ban đầu)
+
+  Servo servo;
+  bool isOpen;
+  int currentPos;
+  unsigned long openTime;
+};
+
+// ================== LOCKER CONFIG ==================
+// 👉 CHỈ CẦN CHỈNH angleClose CỦA L1
+LockerHW lockers[] = {
+  // id   relay servo activeLow   open  close
+  { "L1", 5,    19,    false,       0,    100 }, // L1 đóng ở 110°
+  { "M1", 25,   26,   false,       90,    0   }, // M1 bình thường
+};
+
+const int N = sizeof(lockers) / sizeof(lockers[0]);
+
+// ================== AUTO CLOSE ==================
+const unsigned long AUTO_CLOSE_DELAY = 60000;
+unsigned long lastPoll = 0;
+
+// =====================================================================
+// FIREBASE REST
+// =====================================================================
+String firebaseGet(String path) {
+  HTTPClient http;
+  http.begin(FIREBASE_URL + path + ".json");
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return "";
+  }
+  String payload = http.getString();
+  http.end();
+  return payload;
+}
+
+void firebaseSet(String path, String json) {
+  HTTPClient http;
+  http.begin(FIREBASE_URL + path + ".json");
+  http.addHeader("Content-Type", "application/json");
+  http.PUT(json);
+  http.end();
+}
+
+String lockerBase(const char* id) {
+  return String("/Lockers/") + id;
+}
+
+void clearCommand(const char* id) {
+  firebaseSet(lockerBase(id) + "/command", "\"none\"");
+}
+
+// =====================================================================
+// HARDWARE CONTROL
+// =====================================================================
+void setRelay(LockerHW &L, bool on) {
+  digitalWrite(L.relayPin,
+               L.activeLow ? (on ? LOW : HIGH)
+                           : (on ? HIGH : LOW));
+}
+
+// ---- SERVO QUAY ÊM ----
+void moveServoSmooth(LockerHW &L, int target) {
+  if (L.currentPos == target) return;
+
+  int step = (target > L.currentPos) ? SERVO_STEP : -SERVO_STEP;
+
+  while (L.currentPos != target) {
+    L.currentPos += step;
+    L.servo.write(L.currentPos);
+    delay(SERVO_STEP_DELAY);
+  }
+}
+
+// ---- OPEN ----
+void doOpen(LockerHW &L) {
+  setRelay(L, true);
+  delay(400);
+
+  moveServoSmooth(L, L.angleOpen);
+
+  L.isOpen = true;
+  L.openTime = millis();
+  firebaseSet(lockerBase(L.id) + "/door", "\"open\"");
+}
+
+// ---- CLOSE ----
+void doClose(LockerHW &L) {
+  moveServoSmooth(L, L.angleClose);
+
+  delay(300);
+  setRelay(L, false);
+
+  L.isOpen = false;
+  firebaseSet(lockerBase(L.id) + "/door", "\"closed\"");
+}
+
+// =====================================================================
+// SETUP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(400);
+  }
+  Serial.println("\nWiFi connected");
+
+  // Init lockers
+  for (int i = 0; i < N; i++) {
+    pinMode(lockers[i].relayPin, OUTPUT);
+    digitalWrite(lockers[i].relayPin,
+                 lockers[i].activeLow ? HIGH : LOW);
+
+    lockers[i].servo.setPeriodHertz(50);
+    lockers[i].servo.attach(lockers[i].servoPin, 500, 2500);
+
+    // Góc ban đầu = góc đóng
+    lockers[i].currentPos = lockers[i].angleClose;
+    lockers[i].servo.write(lockers[i].currentPos);
+
+    lockers[i].isOpen = false;
+
+    firebaseSet(lockerBase(lockers[i].id) + "/command", "\"none\"");
+    firebaseSet(lockerBase(lockers[i].id) + "/door", "\"closed\"");
+  }
+
+  Serial.println("System ready");
+}
+
+// =====================================================================
+// LOOP
+// =====================================================================
+void loop() {
+
+  // AUTO CLOSE
+  for (int i = 0; i < N; i++) {
+    if (lockers[i].isOpen &&
+        millis() - lockers[i].openTime >= AUTO_CLOSE_DELAY) {
+      doClose(lockers[i]);
+      clearCommand(lockers[i].id);
+    }
+  }
+
+  // POLL FIREBASE
+  if (millis() - lastPoll < 1000) return;
+  lastPoll = millis();
+
+  String raw = firebaseGet("/Lockers");
+  if (raw.length() == 0) return;
+
+  StaticJsonDocument<4096> doc;
+  if (deserializeJson(doc, raw)) return;
+
+  for (int i = 0; i < N; i++) {
+    const char* id = lockers[i].id;
+    const char* cmd = doc[id]["command"] | "none";
+
+    if (strcmp(cmd, "open") == 0) {
+      doOpen(lockers[i]);
+      clearCommand(id);
+    }
+    else if (strcmp(cmd, "close") == 0) {
+      doClose(lockers[i]);
+      clearCommand(id);
+    }
+  }
+}
